@@ -15,6 +15,30 @@ Amazon ML Challenge 2026 experiments using business names and addresses across t
 
 The later experiments were evaluated locally. Their local validation scores are not leaderboard scores, and they are not the selected 0.84 submission.
 
+## High-level architecture
+
+This diagram describes the selected **0.84 leaderboard submission**. The two stages are candidate generation (blocking) and match classification.
+
+```mermaid
+flowchart TD
+    S1["Source 1 businesses"] --> Q["E5 embeddings of name + address"]
+    S23["Source 2 and Source 3 records"] --> P["E5 embeddings of name + address"]
+    P --> IDX["FAISS IVF-PQ indexes by country"]
+    Q --> SEARCH["Search same-country index"]
+    IDX --> SEARCH
+    SEARCH --> R["Retrieve 200 approximate neighbors; rerank by cosine similarity"]
+    R --> C["Keep top 20 candidates per Source 1 business"]
+    C --> CP["candidate_pairs.tsv"]
+    C --> F["Pair features: embedding cosine, name, address, numbers, units and missingness"]
+    F --> M["Trained HistGradientBoostingClassifier"]
+    M --> KEEP["Keep pairs with score at least 0.70"]
+    KEEP --> OUT["matching_results.tsv: one row per Source 1; empty if no matches"]
+```
+
+**How the matcher learns:** Candidate pairs generated from training records are labeled using the training ground truth. Features from 3,000 Source 1 businesses train the classifier; 500 businesses tune the cutoff and 500 evaluate the pipeline. The E5 encoder remains frozen. At test time, the trained classifier scores candidates without ground-truth labels.
+
+**Why both stages?** Embedding search narrows the large record pool to likely matches. The classifier examines each shortlisted pair in more detail before accepting it. The exported candidate set contains 20 records per business; the intermediate approximate search considers 200 neighbors.
+
 ## Workflow
 
 The embedding encoder represents records as vectors. Country-specific FAISS search retrieves a shortlist. A classifier combines embedding cosine similarity with name, address, numeric and missingness features to select final matches.
