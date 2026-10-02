@@ -1,0 +1,389 @@
+import os, json, time, gc, sqlite3, hashlib, shutil, pickle, re, unicodedata
+from pathlib import Path
+from functools import lru_cache
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import HistGradientBoostingClassifier
+from threadpoolctl import threadpool_limits
+COLS = ['entity_id', 'business_name', 'business_address', 'country']
+
+LEGAL = set('inc incorporated llc llp ltd limited pvt private corp corporation company co plc sarl sas eurl'.split())
+
+ADDR_ALIAS = {'road': 'rd', 'street': 'st', 'avenue': 'ave', 'drive': 'dr', 'lane': 'ln', 'boulevard': 'blvd', 'apartment': 'apt', 'suite': 'ste'}
+
+FEATURES = ['name_exact', 'core_name_exact', 'name_trigram_jaccard', 'name_token_jaccard', 'name_token_containment', 'name_length_ratio', 'address_exact', 'address_trigram_jaccard', 'address_token_jaccard', 'address_token_containment', 'address_missing', 'number_jaccard', 'number_disjoint', 'unit_equal', 'unit_conflict', 'country_equal', 'name_token_count', 'candidate_name_token_count']
+
+def log(s):
+    print(s, flush=True)
+
+def norm(s):
+    s = unicodedata.normalize('NFKC', str(s)).casefold()
+    return ' '.join(re.findall('[^\\W_]+', s))
+
+def canonical_address(s):
+    return ' '.join((ADDR_ALIAS.get(t, t) for t in norm(s).split() if t not in {'null', 'none'}))
+
+def grams(s):
+    return frozenset((s[i:i + 3] for i in range(max(0, len(s) - 2))))
+
+def unit_id(s):
+    m = re.search('\\b(?:unit|suite|ste|apt|apartment|flat)\\s*(?:no\\.?\\s*)?[:#-]?\\s*([\\w]+)', unicodedata.normalize('NFKC', s).casefold())
+    return m.group(1) if m else ''
+
+@lru_cache(maxsize=30000)
+def prepared(name, address, country):
+    n = norm(name)
+    a = canonical_address(address)
+    nt, at = (frozenset(n.split()), frozenset(a.split()))
+    core = tuple(sorted((t for t in nt if t not in LEGAL)))
+    nums = frozenset(re.findall('\\d+[a-z]*', a))
+    return (n, a, nt, at, core, nums, grams(n), grams(a), unit_id(address), norm(country))
+
+def jaccard(a, b):
+    return len(a & b) / len(a | b) if a or b else 0.0
+
+def containment(a, b):
+    return len(a & b) / min(len(a), len(b)) if a and b else 0.0
+
+def features(left, right):
+    n, a, nt, at, c, nums, ng, ag, u, country = prepared(*left[1:])
+    m, b, mt, bt, d, other_nums, mg, bg, v, other_country = prepared(*right[1:])
+    return [float(bool(n) and n == m), float(bool(c) and c == d), jaccard(ng, mg), jaccard(nt, mt), containment(nt, mt), min(len(n), len(m)) / max(len(n), len(m), 1), float(bool(a) and a == b), jaccard(ag, bg), jaccard(at, bt), containment(at, bt), float(not a or not b), jaccard(nums, other_nums), float(bool(nums) and bool(other_nums) and (not nums & other_nums)), float(bool(u) and bool(v) and (u == v)), float(bool(u) and bool(v) and (u != v)), float(bool(country) and country == other_country), len(nt), len(mt)]
+
+def read_chunks(path, cols=COLS):
+    return pd.read_csv(path, sep='\t', dtype=str, keep_default_na=False, usecols=cols, chunksize=100000)
+
+def reproduce_reference_sample(data):
+    from sklearn.model_selection import train_test_split
+    rng = np.random.default_rng(2026)
+    sample = pd.DataFrame()
+    for chunk in read_chunks(data / 'train/train_source1.tsv'):
+        chunk = chunk[COLS].copy()
+        chunk['_priority'] = rng.random(len(chunk))
+        sample = pd.concat([sample, chunk], ignore_index=True).nsmallest(4000, '_priority')
+    sample = sample.drop(columns='_priority').reset_index(drop=True)
+    assert len(sample) == 4000 and sample.entity_id.is_unique
+    ids = set(sample.entity_id)
+    truth = {}
+    for chunk in read_chunks(data / 'train/train_ground_truth.tsv', ['source1_entity_id', 'matched_entity_ids']):
+        for row in chunk[chunk.source1_entity_id.isin(ids)].itertuples(index=False):
+            truth[row.source1_entity_id] = set((x.strip() for x in row.matched_entity_ids.split(',') if x.strip()))
+    assert set(truth) == ids
+    strata = sample.country + '|' + sample.entity_id.map(lambda x: str(not truth[x]))
+    train_idx, held = train_test_split(np.arange(4000), test_size=0.25, random_state=2026, stratify=strata)
+    tune_idx, eval_idx = train_test_split(held, test_size=0.5, random_state=2027, stratify=strata.iloc[held])
+    sample['split'] = 'train'
+    sample.loc[tune_idx, 'split'] = 'tune'
+    sample.loc[eval_idx, 'split'] = 'evaluation'
+    return (sample, truth)
+
+def clean_embedding_text(s):
+    return ' '.join(unicodedata.normalize('NFKC', str(s)).split())
+
+def text_view(frame, view):
+    if view == 'name':
+        return ['query: ' + clean_embedding_text(x) for x in frame.business_name]
+    return ['query: business name: ' + clean_embedding_text(n) + '; address: ' + clean_embedding_text(a) for n, a in zip(frame.business_name, frame.business_address)]
+
+MODEL_ID='intfloat/multilingual-e5-small'
+REVISION='614241f622f53c4eeff9890bdc4f31cfecc418b3'
+DIM=384
+VERSION='full-pool-e5-v1'
+
+def atomic_json(path, value):
+    tmp=Path(str(path)+'.tmp')
+    tmp.write_text(json.dumps(value,indent=2))
+    os.replace(tmp,path)
+
+def initialize(data,work):
+    work=Path(work); data=Path(data); work.mkdir(parents=True,exist_ok=True)
+    files=[data/f'train/train_source{i}.tsv' for i in (1,2,3)]+[data/'train/train_ground_truth.tsv']
+    for p in files:
+        assert p.exists(),f'Missing dataset: {p}'
+    config={'version':VERSION,'model':MODEL_ID,'revision':REVISION,'dim':DIM,
+            'max_length':256,'text':'query: business name: NAME; address: ADDRESS',
+            'files':[(str(p),p.stat().st_size) for p in files],
+            'nlist_max':2048,'pq_m':48,'pq_bits':8,'nprobe':64,'overfetch':200,
+            'candidate_k':20,'sample_seed':2026,'sample_size':4000}
+    cp=work/'configuration.json'
+    if cp.exists():
+        assert json.loads(cp.read_text())==json.loads(json.dumps(config)), 'Configuration changed. Use a new WORK folder.'
+    else: atomic_json(cp,config)
+    log(f'Free disk: {shutil.disk_usage(work).free/2**30:.1f} GiB')
+    return data,work
+
+class Encoder:
+    def __init__(self,batch_size=64):
+        import torch
+        from transformers import AutoTokenizer,AutoModel
+        assert torch.cuda.is_available(),'Enable a GPU in Kaggle Settings, then restart/run all.'
+        self.torch=torch; self.batch_size=batch_size
+        self.tokenizer=AutoTokenizer.from_pretrained(MODEL_ID,revision=REVISION,trust_remote_code=False)
+        self.model=AutoModel.from_pretrained(MODEL_ID,revision=REVISION,trust_remote_code=False,
+                                           use_safetensors=True).cuda().half().eval()
+        log('GPU: '+torch.cuda.get_device_name(0))
+    def encode(self,frame):
+        texts=text_view(frame,'combined'); parts=[]; torch=self.torch
+        with torch.inference_mode():
+            for start in range(0,len(texts),self.batch_size):
+                inp=self.tokenizer(texts[start:start+self.batch_size],max_length=256,
+                                   padding=True,truncation=True,return_tensors='pt').to('cuda')
+                hidden=self.model(**inp).last_hidden_state.float()
+                mask=inp['attention_mask'].unsqueeze(-1)
+                vec=(hidden*mask).sum(1)/mask.sum(1).clamp(min=1)
+                vec=torch.nn.functional.normalize(vec,p=2,dim=1)
+                parts.append(vec.cpu().numpy())
+        return np.concatenate(parts).astype('float32') if parts else np.empty((0,DIM),np.float32)
+
+def open_records(work):
+    db=sqlite3.connect(work/'records.sqlite')
+    db.execute('PRAGMA cache_size=-65536')
+    db.execute('CREATE TABLE IF NOT EXISTS records (rid INTEGER PRIMARY KEY, entity_id TEXT, business_name TEXT, business_address TEXT, country TEXT)')
+    db.execute('CREATE TABLE IF NOT EXISTS progress (source INTEGER PRIMARY KEY, done INTEGER, complete INTEGER)')
+    db.commit()
+    return db
+
+def encode_pool(data,work,encoder,split="train",reserve_gib=5):
+    """Vectors flushed before SQLite transaction commits; uncommitted rows overwritten on restart."""
+    manifest_path=work/'pool_manifest.json'
+    if not manifest_path.exists():
+        counts={}
+        for source in (2,3):
+            counts[str(source)]=sum(len(c) for c in read_chunks(data/f'{split}/{split}_source{source}.tsv',['entity_id']))
+        atomic_json(manifest_path,{'counts':counts,'total':sum(counts.values())})
+    manifest=json.loads(manifest_path.read_text()); total=manifest['total']
+    vp=work/'vectors.f16'; needed=total*DIM*2
+    db=open_records(work)
+    exists=vp.exists()
+    if not exists:
+        assert db.execute('SELECT COUNT(*) FROM records').fetchone()[0]==0,'Vectors missing but database has progress. Restore both or use new WORK.'
+        # Includes space for metadata DB, compressed indexes, model cache and reserve.
+        assert shutil.disk_usage(work).free>needed+reserve_gib*2**30, f'Need {needed/2**30+reserve_gib:.1f} GiB free for this encoding stage.'
+    else: assert vp.stat().st_size==needed,'Incomplete vector allocation. Use new WORK directory.'
+    vectors=np.memmap(vp,mode='r+' if exists else 'w+',dtype=np.float16,shape=(total,DIM))
+    base=0; started=time.time(); encoded=0
+    for source in (2,3):
+        saved=db.execute('SELECT done,complete FROM progress WHERE source=?',(source,)).fetchone()
+        done=saved[0] if saved else 0
+        if saved and saved[1]:
+            log(f'Source {source}: already encoded {done:,} rows'); base+=manifest['counts'][str(source)]; continue
+        log(f'Source {source}: resume at {done:,}; reading input from beginning to that position')
+        seen=0
+        chunks=pd.read_csv(data/f'{split}/{split}_source{source}.tsv',sep='\t',dtype=str,
+                           keep_default_na=False,usecols=COLS,chunksize=10000)
+        for frame in chunks:
+            end=seen+len(frame)
+            if end<=done: seen=end; continue
+            frame=frame.iloc[max(0,done-seen):][COLS]
+            first=max(done,seen); batch=encoder.encode(frame)
+            assert batch.shape==(len(frame),DIM) and np.isfinite(batch).all()
+            vectors[base+first:base+end]=batch.astype(np.float16); vectors.flush()
+            rows=[(base+first+j,str(r.entity_id),str(r.business_name),str(r.business_address),norm(r.country))
+                  for j,r in enumerate(frame.itertuples(index=False))]
+            with db:
+                db.executemany('INSERT INTO records VALUES (?,?,?,?,?)',rows)
+                db.execute('INSERT OR REPLACE INTO progress VALUES (?,?,0)',(source,end))
+            encoded+=len(frame); seen=end; done=end
+            if end%100000==0:
+                rate=encoded/max(time.time()-started,1)
+                remaining=total-(base+end)
+                log(f'Source {source}: {end:,}; {rate:.0f} rows/sec; remaining encoding ~{remaining/rate/60:.1f} min')
+                assert shutil.disk_usage(work).free>1.5*2**30,'Low disk. Progress saved; free space before resuming.'
+        assert done==manifest['counts'][str(source)]
+        with db: db.execute('INSERT OR REPLACE INTO progress VALUES (?,?,1)',(source,done))
+        base+=done
+    assert db.execute('SELECT COUNT(*) FROM records').fetchone()[0]==total
+    atomic_json(work/'encoding_complete.json',{'total':total})
+    db.close(); del vectors
+    log(f'Encoding complete: {total:,} target records.')
+
+def build_indexes(work):
+    """IVF-PQ index per country. Completed countries and trained quantizers are reusable."""
+    import faiss
+    faiss.omp_set_num_threads(min(4,os.cpu_count() or 2))
+    total=json.loads((work/'encoding_complete.json').read_text())['total']
+    vectors=np.memmap(work/'vectors.f16',mode='r',dtype=np.float16,shape=(total,DIM))
+    db=open_records(work)
+    countries=[r[0] for r in db.execute('SELECT DISTINCT country FROM records')]
+    catalog=[]
+    for country in sorted(countries):
+        token=hashlib.sha256(country.encode()).hexdigest()[:12]
+        path=work/f'index_{token}.faiss'; trained=work/f'trained_{token}.faiss'
+        count=db.execute('SELECT COUNT(*) FROM records WHERE country=?',(country,)).fetchone()[0]
+        catalog.append({'country':country,'file':path.name,'count':count})
+        if path.exists():
+            check=faiss.read_index(str(path)); assert check.ntotal==count
+            del check; log(f'{country}: completed index reused'); continue
+        ids=np.fromiter((r[0] for r in db.execute('SELECT rid FROM records WHERE country=? ORDER BY rid',(country,))),dtype=np.int64,count=count)
+        # At least 50 training vectors per IVF centroid, up to 100k training vectors.
+        nlist=min(2048,max(1,count//50))
+        if trained.exists(): index=faiss.read_index(str(trained))
+        elif count<10000:
+            index=faiss.IndexIDMap2(faiss.IndexFlatIP(DIM))
+        else:
+            index=faiss.IndexIVFPQ(faiss.IndexFlatIP(DIM),DIM,nlist,48,8,faiss.METRIC_INNER_PRODUCT)
+            index.cp.seed=2026; index.pq.cp.seed=2026
+            train_ids=np.random.default_rng(2026).choice(ids,size=min(count,110000),replace=False)
+            train_vectors=np.asarray(vectors[np.sort(train_ids)],dtype=np.float32)
+            faiss.normalize_L2(train_vectors)
+            log(f'{country}: training IVF-PQ on {len(train_vectors):,} vectors; {nlist} cells')
+            index.train(train_vectors); del train_vectors
+            faiss.write_index(index,str(trained)+'.tmp'); os.replace(str(trained)+'.tmp',trained)
+        started=time.time()
+        # An interrupted country is re-added from its saved trained quantizer.
+        for start in range(0,count,25000):
+            batch_ids=ids[start:start+25000]
+            x=np.asarray(vectors[batch_ids],dtype=np.float32); faiss.normalize_L2(x)
+            index.add_with_ids(x,batch_ids)
+            if start%250000==0: log(f'{country}: indexed {min(start+25000,count):,}/{count:,}; {(time.time()-started)/60:.1f} min')
+        assert index.ntotal==count
+        faiss.write_index(index,str(path)+'.tmp'); os.replace(str(path)+'.tmp',path)
+        del index,ids; gc.collect()
+    atomic_json(work/'index_catalog.json',catalog)
+    db.close(); del vectors
+    log('All country indexes ready.')
+
+def prepare_queries(data,work,encoder):
+    sample_path=work/'sample.pkl'
+    if sample_path.exists():
+        with sample_path.open('rb') as f: sample,truth=pickle.load(f)
+    else:
+        sample,truth=reproduce_reference_sample(data)
+        with Path(str(sample_path)+'.tmp').open('wb') as f: pickle.dump((sample,truth),f)
+        os.replace(str(sample_path)+'.tmp',sample_path)
+        sample.to_csv(work/'sample.tsv',sep='\t',index=False)
+    path=work/'query_vectors.npy'
+    if path.exists(): q=np.load(path)
+    else:
+        q=encoder.encode(sample)
+        with Path(str(path)+'.tmp').open('wb') as f: np.save(f,q)
+        os.replace(str(path)+'.tmp',path)
+    assert q.shape==(len(sample),DIM)
+    log(f'Sample splits: {sample.split.value_counts().to_dict()}')
+    return sample,truth,q
+
+def retrieve(work,sample,q,nprobe=64,overfetch=200,save_k=50):
+    import faiss
+    query_key=hashlib.sha256(('|'.join(sample.entity_id)).encode()).hexdigest()[:12]
+    cache=work/f'retrieval_{query_key}_p{nprobe}_r{overfetch}_k{save_k}.npz'
+    if cache.exists():
+        saved=np.load(cache); return saved['ids'],saved['scores']
+    total=json.loads((work/'encoding_complete.json').read_text())['total']
+    vectors=np.memmap(work/'vectors.f16',mode='r',dtype=np.float16,shape=(total,DIM))
+    ids=np.full((len(q),save_k),-1,np.int64); scores=np.full((len(q),save_k),-1,np.float32)
+    countries=sample.country.map(norm).to_numpy()
+    for item in json.loads((work/'index_catalog.json').read_text()):
+        qi=np.flatnonzero(countries==item['country'])
+        if not len(qi): continue
+        index=faiss.read_index(str(work/item['file']))
+        if hasattr(index,'nprobe'): index.nprobe=min(nprobe,index.nlist)
+        log(f"Searching {len(qi)} businesses in {item['country']}: {index.ntotal:,} records")
+        for start in range(0,len(qi),64):
+            batch=qi[start:start+64]
+            _,approx=index.search(np.ascontiguousarray(q[batch],dtype=np.float32),overfetch)
+            for i,neighbors in zip(batch,approx):
+                neighbors=np.unique(neighbors[neighbors>=0])
+                if not len(neighbors): continue
+                x=np.asarray(vectors[neighbors],dtype=np.float32)
+                x/=np.maximum(np.linalg.norm(x,axis=1,keepdims=True),1e-12)
+                exact=x@q[i]
+                order=np.lexsort((neighbors,-exact))[:save_k]
+                chosen=neighbors[order]; k=len(chosen)
+                ids[i,:k]=chosen; scores[i,:k]=exact[order]
+        del index; gc.collect()
+    with Path(str(cache)+'.tmp').open('wb') as f: np.savez_compressed(f,ids=ids,scores=scores)
+    os.replace(str(cache)+'.tmp',cache)
+    return ids,scores
+
+def fetch_records(work,ids):
+    db=open_records(work); rows={}
+    valid=np.unique(ids[ids>=0])
+    for start in range(0,len(valid),800):
+        batch=[int(x) for x in valid[start:start+800]]
+        for r in db.execute('SELECT * FROM records WHERE rid IN ('+','.join('?'*len(batch))+')',batch):
+            rows[r[0]]=tuple(r[1:])
+    db.close()
+    assert len(rows)==len(valid)
+    return rows
+
+def retrieval_report(sample,truth,ids,records):
+    out=[]
+    for split in ('train','tune','evaluation'):
+        indices=np.flatnonzero(sample.split.to_numpy()==split)
+        if not len(indices): continue
+        for k in (10,20,50):
+            found=total=0; sizes=[]
+            for i in indices:
+                gt=truth[sample.iloc[i].entity_id]
+                pred={records[int(r)][0] for r in ids[i,:k] if r>=0}
+                found+=len(gt&pred); total+=len(gt); sizes.append(len(pred))
+            out.append(dict(split=split,k=k,found=found,true_links=total,
+                            recall=found/total if total else 1,mean_candidates=float(np.mean(sizes)),
+                            p95_candidates=float(np.percentile(sizes,95)),max_candidates=max(sizes)))
+    return pd.DataFrame(out)
+
+MATCH_FEATURES=FEATURES+['embedding_cosine']
+def make_pairs(sample,truth,ids,scores,records,k=20):
+    x=[]; y=[]; owners=[]; candidate_ids=[]
+    for i,left in enumerate(sample[COLS].itertuples(index=False,name=None)):
+        for rank,rid in enumerate(ids[i,:k]):
+            if rid<0: continue
+            right=records[int(rid)]
+            x.append(features(left,right)+[float(scores[i,rank])])
+            y.append(int(right[0] in truth[left[0]])); owners.append(i); candidate_ids.append(right[0])
+    return np.asarray(x,np.float32),np.asarray(y,np.uint8),np.asarray(owners,np.int32),candidate_ids
+
+def metrics(sample,truth,owners,candidate_ids,prob,threshold,split):
+    selected=np.flatnonzero(sample.split.to_numpy()==split)
+    pred={int(i):set() for i in selected}
+    for i,c,p in zip(owners,candidate_ids,prob):
+        if int(i) in pred and p>=threshold: pred[int(i)].add(c)
+    scores=[]; tp=fp=fn=singletons=singleton_correct=0
+    for i in selected:
+        gt=truth[sample.iloc[i].entity_id]; pr=pred[int(i)]
+        a=len(gt&pr); b=len(pr-gt); c=len(gt-pr)
+        tp+=a; fp+=b; fn+=c
+        if not gt:
+            singletons+=1; singleton_correct+=int(not pr); scores.append(float(not pr))
+        else: scores.append(1.25*a/(1.25*a+b+.25*c))
+    return dict(macro_F05=float(np.mean(scores)),correct_accepted=tp,incorrect_accepted=fp,
+                missed_true_links=fn,singletons_correct=singleton_correct,singletons=singletons)
+
+def fit_and_evaluate(work,sample,truth,ids,scores,records):
+    from importlib.metadata import version
+    x,y,owners,candidate_ids=make_pairs(sample,truth,ids,scores,records,k=20)
+    splits=sample.split.to_numpy()[owners]; train=splits=='train'
+    assert len(np.unique(y[train]))==2,'Need positive and negative training pairs.'
+    log(f'Training new matcher: {train.sum():,} pairs, {y[train].sum():,} true matches')
+    model=HistGradientBoostingClassifier(learning_rate=.08,max_iter=250,max_leaf_nodes=31,
+              l2_regularization=1.,early_stopping=False,random_state=2026)
+    with threadpool_limits(limits=4):
+        model.fit(x[train],y[train]); prob=model.predict_proba(x)[:,1]
+    # Only tuning businesses choose the threshold. Evaluation is read once afterwards.
+    tuning=[]
+    for t in np.linspace(.05,.95,91):
+        tuning.append({'threshold':float(t),**metrics(sample,truth,owners,candidate_ids,prob,t,'tune')})
+    best=max(tuning,key=lambda d:(d['macro_F05'],d['threshold']))
+    cutoff=best['threshold']
+    evaluation=metrics(sample,truth,owners,candidate_ids,prob,cutoff,'evaluation')
+    selected=np.flatnonzero(sample.split.to_numpy()=='evaluation')
+    search_missed=0
+    for i in selected:
+        retrieved={records[int(r)][0] for r in ids[i,:20] if r>=0}
+        search_missed+=len(truth[sample.iloc[i].entity_id]-retrieved)
+    evaluation['missed_by_search']=search_missed
+    evaluation['retrieved_but_rejected']=evaluation['missed_true_links']-search_missed
+    result={'version':VERSION,'model_id':MODEL_ID,'revision':REVISION,'candidate_k':20,
+            'ann_nprobe':64,'ann_overfetch':200,'threshold':cutoff,'tuning':best,
+            'evaluation':evaluation,'features':MATCH_FEATURES,
+            'scope':'Full training S2/S3; 3000 S1 train, 500 tune, 500 evaluation; no test predictions.',
+            'versions':{p:version(p) for p in ['numpy','pandas','scikit-learn','faiss-cpu','torch','transformers']}}
+    atomic_json(work/'experiment_results.json',result)
+    pd.DataFrame(tuning).to_csv(work/'threshold_tuning.csv',index=False)
+    with (work/'matcher.pkl').open('wb') as f: pickle.dump({'model':model,'threshold':cutoff,'features':MATCH_FEATURES},f)
+    # Save diagnostics, clearly labeled TRAINING evaluation, not a portal submission.
+    diag=pd.DataFrame({'source1_id':sample.entity_id.to_numpy()[owners],'candidate_id':candidate_ids,
+                       'split':splits,'label':y,'score':prob})
+    diag[diag.split!='train'].to_csv(work/'heldout_pair_scores.tsv',sep='\t',index=False)
+    log(json.dumps(result,indent=2))
+    return result
